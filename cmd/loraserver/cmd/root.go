@@ -66,7 +66,7 @@ func init() {
 
 	viper.SetDefault("network_server.gateway.stats.aggregation_intervals", []string{"minute", "hour", "day"})
 	viper.SetDefault("network_server.gateway.stats.create_gateway_on_stats", true)
-	viper.SetDefault("network_server.gateway.backend.mqtt.server", "tcp://localhost:1883")
+	viper.SetDefault("network_server.gateway.backend.mqtt.servers", []string{"tcp://localhost:1883"})
 
 	viper.SetDefault("join_server.default.server", "http://localhost:8003")
 

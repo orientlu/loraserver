@@ -14,6 +14,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/gomodule/redigo/redis"
+	coordinator "github.com/orientlu/lora-coordinator/api/gateway"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
@@ -44,7 +45,7 @@ type Backend struct {
 	statsPacketChan   chan gw.GatewayStats
 	downlinkTXAckChan chan gw.DownlinkTXAck
 
-	conn                paho.Client
+	conns               map[string]paho.Client
 	redisPool           *redis.Pool
 	downlinkTemplate    *template.Template
 	configTemplate      *template.Template
@@ -66,6 +67,7 @@ func NewBackend(redisPool *redis.Pool, c config.Config) (gateway.Gateway, error)
 		statsPacketChan:     make(chan gw.GatewayStats),
 		downlinkTXAckChan:   make(chan gw.DownlinkTXAck),
 		gatewayMarshaler:    make(map[lorawan.EUI64]marshaler.Type),
+		conns:               make(map[string]paho.Client, len(conf.Servers)),
 		redisPool:           redisPool,
 		uplinkTopicTemplate: conf.UplinkTopicTemplate,
 		statsTopicTemplate:  conf.StatsTopicTemplate,
@@ -83,38 +85,49 @@ func NewBackend(redisPool *redis.Pool, c config.Config) (gateway.Gateway, error)
 		return nil, errors.Wrap(err, "gateway/mqtt: parse config template error")
 	}
 
-	opts := paho.NewClientOptions()
-	opts.AddBroker(conf.Server)
-	opts.SetUsername(conf.Username)
-	opts.SetPassword(conf.Password)
-	opts.SetCleanSession(conf.CleanSession)
-	opts.SetClientID(conf.ClientID)
-	opts.SetOnConnectHandler(b.onConnected)
-	opts.SetConnectionLostHandler(b.onConnectionLost)
-
-	tlsconfig, err := newTLSConfig(conf.CACert, conf.TLSCert, conf.TLSKey)
-	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"ca_cert":  conf.CACert,
-			"tls_cert": conf.TLSCert,
-			"tls_key":  conf.TLSKey,
-		}).Fatal("gateway/mqtt: error loading mqtt certificate files")
-	}
-	if tlsconfig != nil {
-		opts.SetTLSConfig(tlsconfig)
-	}
-
-	log.WithField("server", conf.Server).Info("gateway/mqtt: connecting to mqtt broker")
-	b.conn = paho.NewClient(opts)
-	for {
-		if token := b.conn.Connect(); token.Wait() && token.Error() != nil {
-			log.Errorf("gateway/mqtt: connecting to mqtt broker failed, will retry in 2s: %s", token.Error())
-			time.Sleep(2 * time.Second)
-		} else {
-			break
+	var wg sync.WaitGroup
+	for i, broker := range conf.Servers {
+		if broker == "" {
+			continue
 		}
-	}
+		opts := paho.NewClientOptions()
+		opts.AddBroker(broker)
+		opts.SetUsername(conf.Username)
+		opts.SetPassword(conf.Password)
+		opts.SetCleanSession(conf.CleanSession)
+		opts.SetClientID(fmt.Sprintf("%s-%d", conf.ClientID, i))
+		opts.SetOnConnectHandler(b.onConnected)
+		opts.SetConnectionLostHandler(b.onConnectionLost)
 
+		tlsconfig, err := newTLSConfig(conf.CACert, conf.TLSCert, conf.TLSKey)
+		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"ca_cert":  conf.CACert,
+				"tls_cert": conf.TLSCert,
+				"tls_key":  conf.TLSKey,
+			}).Fatal("gateway/mqtt: error loading mqtt certificate files")
+		}
+		if tlsconfig != nil {
+			opts.SetTLSConfig(tlsconfig)
+		}
+
+		log.WithField("server", broker).Info("gateway/mqtt: connecting to mqtt broker")
+		b.conns[broker] = paho.NewClient(opts)
+
+		go func(broker string) {
+			wg.Add(1)
+			defer wg.Done()
+			for {
+				if token := b.conns[broker].Connect(); token.Wait() && token.Error() != nil {
+					log.Errorf("gateway/mqtt: connecting to mqtt broker failed, will retry in 2s: %s", token.Error())
+					time.Sleep(2 * time.Second)
+				} else {
+					break
+				}
+			}
+		}(broker)
+	}
+	wg.Wait()
 	return &b, nil
 }
 
@@ -124,20 +137,20 @@ func NewBackend(redisPool *redis.Pool, c config.Config) (gateway.Gateway, error)
 // still packets to send back to the gateway).
 func (b *Backend) Close() error {
 	log.Info("gateway/mqtt: closing backend")
-
-	log.WithField("topic", b.uplinkTopicTemplate).Info("gateway/mqtt: unsubscribing from rx topic")
-	if token := b.conn.Unsubscribe(b.uplinkTopicTemplate); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("gateway/mqtt: unsubscribe from %s error: %s", b.uplinkTopicTemplate, token.Error())
+	for _, c := range b.conns {
+		log.WithField("topic", b.uplinkTopicTemplate).Info("gateway/mqtt: unsubscribing from rx topic")
+		if token := c.Unsubscribe(b.uplinkTopicTemplate); token.Wait() && token.Error() != nil {
+			return fmt.Errorf("gateway/mqtt: unsubscribe from %s error: %s", b.uplinkTopicTemplate, token.Error())
+		}
+		log.WithField("topic", b.statsTopicTemplate).Info("gateway/mqtt: unsubscribing from stats topic")
+		if token := c.Unsubscribe(b.statsTopicTemplate); token.Wait() && token.Error() != nil {
+			return fmt.Errorf("gateway/mqtt: unsubscribe from %s error: %s", b.statsTopicTemplate, token.Error())
+		}
+		log.WithField("topic", b.ackTopicTemplate).Info("backend/gateway: unsubscribing from ack topic")
+		if token := c.Unsubscribe(b.ackTopicTemplate); token.Wait() && token.Error() != nil {
+			return fmt.Errorf("backend/gateway: unsubscribe from %s error: %s", b.ackTopicTemplate, token.Error())
+		}
 	}
-	log.WithField("topic", b.statsTopicTemplate).Info("gateway/mqtt: unsubscribing from stats topic")
-	if token := b.conn.Unsubscribe(b.statsTopicTemplate); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("gateway/mqtt: unsubscribe from %s error: %s", b.statsTopicTemplate, token.Error())
-	}
-	log.WithField("topic", b.ackTopicTemplate).Info("backend/gateway: unsubscribing from ack topic")
-	if token := b.conn.Unsubscribe(b.ackTopicTemplate); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("backend/gateway: unsubscribe from %s error: %s", b.ackTopicTemplate, token.Error())
-	}
-
 	log.Info("backend/gateway: handling last messages")
 	b.wg.Wait()
 	close(b.rxPacketChan)
@@ -184,7 +197,14 @@ func (b *Backend) SendTXPacket(txPacket gw.DownlinkFrame) error {
 		"qos":   b.qos,
 	}).Info("gateway/mqtt: publishing downlink frame")
 
-	if token := b.conn.Publish(topic.String(), b.qos, false, bb); token.Wait() && token.Error() != nil {
+	broker, err := coordinator.GetGatewayMapMqttURL(b.redisPool, gatewayID[:])
+	if err != nil {
+		return errors.Wrap(err, "gateway/mqtt: get mqtt broker error")
+	}
+	if broker == "" {
+		return errors.New("gateway/mqtt: can not get mqtt broker")
+	}
+	if token := b.conns[broker].Publish(topic.String(), b.qos, false, bb); token.Wait() && token.Error() != nil {
 		return errors.Wrap(err, "gateway/mqtt: publish downlink frame error")
 	}
 	return nil
@@ -209,7 +229,15 @@ func (b *Backend) SendGatewayConfigPacket(configPacket gw.GatewayConfiguration) 
 		"qos":   b.qos,
 	}).Info("gateway/mqtt: publishing gateway configuration")
 
-	if token := b.conn.Publish(topic.String(), b.qos, false, bb); token.Wait() && token.Error() != nil {
+	broker, err := coordinator.GetGatewayMapMqttURL(b.redisPool, gatewayID[:])
+	if err != nil {
+		return errors.Wrap(err, "gateway/mqtt: get mqtt broker error")
+	}
+	if broker == "" {
+		return errors.New("gateway/mqtt: can not get mqtt broker")
+	}
+
+	if token := b.conns[broker].Publish(topic.String(), b.qos, false, bb); token.Wait() && token.Error() != nil {
 		return errors.Wrap(err, "gateway/mqtt: publish gateway configuration error")
 	}
 
@@ -353,7 +381,7 @@ func (b *Backend) onConnected(c paho.Client) {
 			"topic": b.uplinkTopicTemplate,
 			"qos":   b.qos,
 		}).Info("gateway/mqtt: subscribing to rx topic")
-		if token := b.conn.Subscribe(b.uplinkTopicTemplate, b.qos, b.rxPacketHandler); token.Wait() && token.Error() != nil {
+		if token := c.Subscribe(b.uplinkTopicTemplate, b.qos, b.rxPacketHandler); token.Wait() && token.Error() != nil {
 			log.WithFields(log.Fields{
 				"topic": b.uplinkTopicTemplate,
 				"qos":   b.qos,
@@ -369,7 +397,7 @@ func (b *Backend) onConnected(c paho.Client) {
 			"topic": b.statsTopicTemplate,
 			"qos":   b.qos,
 		}).Info("gateway/mqtt: subscribing to stats topic")
-		if token := b.conn.Subscribe(b.statsTopicTemplate, b.qos, b.statsPacketHandler); token.Wait() && token.Error() != nil {
+		if token := c.Subscribe(b.statsTopicTemplate, b.qos, b.statsPacketHandler); token.Wait() && token.Error() != nil {
 			log.WithFields(log.Fields{
 				"topic": b.statsTopicTemplate,
 				"qos":   b.qos,
@@ -385,7 +413,7 @@ func (b *Backend) onConnected(c paho.Client) {
 			"topic": b.ackTopicTemplate,
 			"qos":   b.qos,
 		}).Info("backend/gateway: subscribing to ack topic")
-		if token := b.conn.Subscribe(b.ackTopicTemplate, b.qos, b.ackPacketHandler); token.Wait() && token.Error() != nil {
+		if token := c.Subscribe(b.ackTopicTemplate, b.qos, b.ackPacketHandler); token.Wait() && token.Error() != nil {
 			log.WithFields(log.Fields{
 				"topic": b.ackTopicTemplate,
 				"qos":   b.qos,

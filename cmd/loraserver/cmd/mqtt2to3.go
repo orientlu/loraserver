@@ -3,10 +3,12 @@ package cmd
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,7 +38,7 @@ var mqtt2to3 = &cobra.Command{
 
 // MQTT2To3Backend implement a MQTT forwarder backend.
 type MQTT2To3Backend struct {
-	conn mqtt.Client
+	conns map[string]mqtt.Client
 }
 
 // NewMQTT2To3Backend creates a new Backend.
@@ -44,39 +46,53 @@ func NewMQTT2To3Backend(conf config.Config) (*MQTT2To3Backend, error) {
 	c := conf.NetworkServer.Gateway.Backend.MQTT
 
 	b := MQTT2To3Backend{}
+	b.conns = make(map[string]mqtt.Client, len(c.Servers))
 
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(c.Server)
-	opts.SetUsername(c.Username)
-	opts.SetPassword(c.Password)
-	opts.SetCleanSession(c.CleanSession)
-	opts.SetClientID(c.ClientID)
-	opts.SetOnConnectHandler(b.onConnected)
-
-	tlsconfig, err := newTLSConfig(c.CACert, c.TLSCert, c.TLSKey)
-	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"ca_cert":  c.CACert,
-			"tls_cert": c.TLSCert,
-			"tls_key":  c.TLSKey,
-		}).Fatal("mqtt2to3: error loading mqtt certificate files")
-	}
-	if tlsconfig != nil {
-		opts.SetTLSConfig(tlsconfig)
-	}
-
-	log.WithField("broker", c.Server).Info("mqtt2to3: connecting to mqtt broker")
-	b.conn = mqtt.NewClient(opts)
-
-	for {
-		if token := b.conn.Connect(); token.Wait() && token.Error() != nil {
-			log.WithError(err).Error("mqtt2to3: connecting to mqtt broker failed")
-			time.Sleep(2 * time.Second)
-		} else {
-			break
+	var wg sync.WaitGroup
+	for i, broker := range c.Servers {
+		if broker == "" {
+			continue
 		}
+
+		opts := mqtt.NewClientOptions()
+		opts.AddBroker(broker)
+		opts.SetUsername(c.Username)
+		opts.SetPassword(c.Password)
+		opts.SetCleanSession(c.CleanSession)
+		opts.SetClientID(fmt.Sprintf("%s-%d", c.ClientID, i))
+		opts.SetOnConnectHandler(b.onConnected)
+
+		tlsconfig, err := newTLSConfig(c.CACert, c.TLSCert, c.TLSKey)
+		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"ca_cert":  c.CACert,
+				"tls_cert": c.TLSCert,
+				"tls_key":  c.TLSKey,
+			}).Fatal("mqtt2to3: error loading mqtt certificate files")
+		}
+		if tlsconfig != nil {
+			opts.SetTLSConfig(tlsconfig)
+		}
+
+		log.WithField("broker", broker).Info("mqtt2to3: connecting to mqtt broker")
+		b.conns[broker] = mqtt.NewClient(opts)
+
+		go func(broker string) {
+			wg.Add(1)
+			defer wg.Done()
+
+			for {
+				if token := b.conns[broker].Connect(); token.Wait() && token.Error() != nil {
+					log.WithError(err).Error("mqtt2to3: connecting to mqtt broker failed")
+					time.Sleep(2 * time.Second)
+				} else {
+					break
+				}
+			}
+		}(broker)
 	}
 
+	wg.Wait()
 	return &b, nil
 }
 
@@ -102,7 +118,7 @@ func (b *MQTT2To3Backend) onConnected(c mqtt.Client) {
 	}
 
 	for {
-		if token := b.conn.SubscribeMultiple(topics, b.messageHandler); token.Wait() && token.Error() != nil {
+		if token := c.SubscribeMultiple(topics, b.messageHandler); token.Wait() && token.Error() != nil {
 			log.WithError(token.Error()).Error("mqtt2to3: subscribe error")
 			time.Sleep(time.Second)
 			continue
@@ -111,9 +127,12 @@ func (b *MQTT2To3Backend) onConnected(c mqtt.Client) {
 	}
 }
 
+// Close ..
 func (b *MQTT2To3Backend) Close() error {
 	log.Info("mqtt2to3: closing backend")
-	b.conn.Disconnect(250)
+	for _, c := range b.conns {
+		c.Disconnect(250)
+	}
 	return nil
 }
 
@@ -152,7 +171,7 @@ func (b *MQTT2To3Backend) messageHandler(c mqtt.Client, msg mqtt.Message) {
 		return
 	}
 
-	if token := b.conn.Publish(topic, 0, false, msg.Payload()); token.Wait() && token.Error() != nil {
+	if token := c.Publish(topic, 0, false, msg.Payload()); token.Wait() && token.Error() != nil {
 		log.WithError(token.Error()).WithField("topic", topic).Error("mqtt2to3: publish event error")
 	}
 

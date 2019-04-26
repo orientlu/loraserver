@@ -96,7 +96,7 @@ type Config struct {
 				Type string `mapstructure:"type"`
 
 				MQTT struct {
-					Server                string
+					Servers               []string
 					Username              string
 					Password              string
 					QOS                   uint8  `mapstructure:"qos"`

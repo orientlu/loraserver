@@ -383,7 +383,9 @@ get_downlink_data_delay="{{ .NetworkServer.GetDownlinkDataDelay }}"
     config_topic_template="{{ .NetworkServer.Gateway.Backend.MQTT.ConfigTopicTemplate }}"
 
     # MQTT server (e.g. scheme://host:port where scheme is tcp, ssl or ws)
-    server="{{ .NetworkServer.Gateway.Backend.MQTT.Server }}"
+	servers=[{{ range $i, $v := .NetworkServer.Gateway.Backend.MQTT.Servers }}
+	"{{ .$v }}", {{ end }}
+	]
 
     # Connect with the given username (optional)
     username="{{ .NetworkServer.Gateway.Backend.MQTT.Username }}"
